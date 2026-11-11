@@ -1,0 +1,12 @@
+<consulo-plugin url="https://github.com/consulo/consulo-codex">
+    <id>consulo.codex</id>
+    <name>Codex</name>
+    <version>SNAPSHOT</version>
+    <vendor>consulo.io</vendor>
+    <description>OpenAI Codex as an AI provider, through the native Codex command line app server - chats in the AI Chat tool window, the threads of Codex in the chat tree, approvals and questions answered in the IDE.</description>
+    <localize>consulo.codex.CodexLocalize</localize>
+
+    <tags>
+        <tag>ai</tag>
+    </tags>
+</consulo-plugin>

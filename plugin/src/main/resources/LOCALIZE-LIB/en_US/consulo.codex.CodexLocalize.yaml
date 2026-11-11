@@ -1,0 +1,42 @@
+provider.name:
+    text: Codex (CLI)
+model.default:
+    text: Codex default
+permission.mode.on.request:
+    text: Work in the project, ask before going outside it
+permission.mode.untrusted:
+    text: Ask before commands not known to be safe
+permission.mode.read.only:
+    text: Read only, ask before any change
+permission.mode.full.access:
+    text: Never ask, full access (dangerous)
+label.permissions:
+    text: 'Permissions:'
+label.command.line:
+    text: 'Command line:'
+button.log.in:
+    text: Log In with ChatGPT...
+button.api.key.log.in:
+    text: Use API Key...
+button.log.out:
+    text: Log Out
+dialog.api.key.title:
+    text: Sign in to Codex
+dialog.api.key.prompt:
+    text: 'OpenAI API key:'
+status.checking:
+    text: Checking the login of the codex command line...
+status.cannot.read:
+    text: 'Cannot read the login: {0}'
+status.not.signed.in:
+    text: Not signed in
+status.signed.in:
+    text: Signed in ({0})
+status.signed.in.as:
+    text: Signed in as {0} ({1})
+status.waiting.browser:
+    text: Waiting for the sign-in in the browser...
+status.sign.in.failed:
+    text: 'Sign-in did not finish: {0}'
+error.no.command.line:
+    text: The codex command line was not found on the PATH
