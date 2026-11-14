@@ -20,6 +20,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import consulo.ai.AIChatInfo;
 import consulo.ai.AIContent;
+import consulo.ai.AIContextUsage;
+import consulo.ai.AIMcpServer;
+import consulo.ai.AIMcpServerProvider;
 import consulo.ai.AIMessage;
 import consulo.ai.AIQuestion;
 import consulo.ai.AIQuestionOption;
@@ -27,19 +30,26 @@ import consulo.ai.AIResponse;
 import consulo.ai.AIRole;
 import consulo.ai.AIStopReason;
 import consulo.ai.AIStreamListener;
+import consulo.ai.AIToolCallContent;
 import consulo.ai.AIToolPermissionDecision;
+import consulo.ai.AIToolPermissionOption;
+import consulo.ai.AIToolPermissionOptionKind;
 import consulo.ai.AIToolPermissionRequest;
 import consulo.ai.AIUsage;
 import consulo.ai.acp.AcpConnection;
+import consulo.application.Application;
+import consulo.codex.localize.CodexLocalize;
 import consulo.process.ExecutionException;
 import consulo.process.ProcessHandlerBuilderFactory;
 import consulo.process.cmd.GeneralCommandLine;
 import org.jspecify.annotations.Nullable;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -77,7 +87,13 @@ final class CodexAppServer {
         final @Nullable AIStreamListener myListener;
         final CompletableFuture<AIResponse> myResult = new CompletableFuture<>();
         final StringBuilder myText = new StringBuilder();
-        final List<AIContent> myToolUses = new ArrayList<>();
+        final StringBuilder myThinking = new StringBuilder();
+        final Map<String, AIContent.ToolCall> myToolCalls = new LinkedHashMap<>();
+        /**
+         * The last state of every item which is a tool call, and what its command printed so far.
+         */
+        final Map<String, JsonObject> myItems = new ConcurrentHashMap<>();
+        final Map<String, StringBuilder> myOutputs = new ConcurrentHashMap<>();
         volatile @Nullable String myTurnId;
 
         Turn(@Nullable AIStreamListener listener) {
@@ -112,21 +128,46 @@ final class CodexAppServer {
         });
         connection.onNotification("item/reasoning/summaryTextDelta", params -> {
             Turn turn = myTurns.get(string(params, "threadId"));
-            if (turn != null && turn.myListener != null) {
-                turn.myListener.onThinkingDelta(string(params, "delta"));
-            }
-        });
-        connection.onNotification("item/started", params -> {
-            Turn turn = myTurns.get(string(params, "threadId"));
-            JsonObject item = object(params, "item");
-            AIContent.ToolUse toolUse = item == null ? null : toolUse(item);
-            if (turn != null && toolUse != null) {
+            if (turn != null) {
+                String delta = string(params, "delta");
                 synchronized (turn) {
-                    turn.myToolUses.add(toolUse);
+                    turn.myThinking.append(delta);
                 }
                 if (turn.myListener != null) {
-                    turn.myListener.onToolUse(toolUse);
+                    turn.myListener.onThinkingDelta(delta);
                 }
+            }
+        });
+        connection.onNotification("item/started", params -> onItem(string(params, "threadId"), object(params, "item")));
+        connection.onNotification("item/completed", params -> onItem(string(params, "threadId"), object(params, "item")));
+        connection.onNotification("item/commandExecution/outputDelta", params -> {
+            Turn turn = myTurns.get(string(params, "threadId"));
+            String itemId = string(params, "itemId");
+            if (turn == null) {
+                return;
+            }
+            turn.myOutputs.computeIfAbsent(itemId, id -> new StringBuilder()).append(string(params, "delta"));
+            JsonObject item = turn.myItems.get(itemId);
+            if (item != null) {
+                onItem(string(params, "threadId"), item);
+            }
+        });
+        connection.onNotification("turn/plan/updated", params -> {
+            Turn turn = myTurns.get(string(params, "threadId"));
+            if (turn != null && turn.myListener != null) {
+                turn.myListener.onPlan(CodexItems.plan(params));
+            }
+        });
+        connection.onNotification("thread/tokenUsage/updated", params -> {
+            Turn turn = myTurns.get(string(params, "threadId"));
+            JsonObject usage = object(params, "tokenUsage");
+            if (turn == null || turn.myListener == null || usage == null) {
+                return;
+            }
+            JsonObject last = object(usage, "last");
+            JsonElement window = usage.get("modelContextWindow");
+            if (last != null && window != null && window.isJsonPrimitive()) {
+                turn.myListener.onContextUsage(new AIContextUsage(last.get("totalTokens").getAsLong(), window.getAsLong(), null, null));
             }
         });
         connection.onNotification("turn/completed", params -> onTurnCompleted(string(params, "threadId"), object(params, "turn")));
@@ -388,17 +429,13 @@ final class CodexAppServer {
      * Sends the text as a turn of the thread and completes once Codex finished the turn. Cancelling the future
      * interrupts the turn.
      */
-    CompletableFuture<AIResponse> startTurn(String threadId, String text, @Nullable String model, @Nullable AIStreamListener listener) {
+    CompletableFuture<AIResponse> startTurn(String threadId, List<AIContent> content, @Nullable String model, @Nullable AIStreamListener listener) {
         Turn turn = new Turn(listener);
         if (myTurns.putIfAbsent(threadId, turn) != null) {
             return CompletableFuture.failedFuture(new IllegalStateException("The chat is still answering"));
         }
 
-        JsonObject input = new JsonObject();
-        input.addProperty("type", "text");
-        input.addProperty("text", text);
-        JsonArray inputs = new JsonArray();
-        inputs.add(input);
+        JsonArray inputs = inputs(content);
         myEmpty.remove(threadId);
         JsonObject params = new JsonObject();
         params.addProperty("threadId", threadId);
@@ -453,19 +490,68 @@ final class CodexAppServer {
         }
         List<AIContent> content = new ArrayList<>();
         synchronized (turn) {
+            if (!turn.myThinking.isEmpty()) {
+                content.add(AIContent.thinking(turn.myThinking.toString()));
+            }
             content.add(AIContent.text(turn.myText.toString()));
-            content.addAll(turn.myToolUses);
+            content.addAll(turn.myToolCalls.values());
         }
         AIStopReason stopReason = "interrupted".equals(status) ? AIStopReason.CANCELLED : AIStopReason.END_TURN;
         turn.myResult.complete(new AIResponse(new AIMessage(AIRole.ASSISTANT, content), stopReason, AIUsage.UNKNOWN));
     }
 
+    /**
+     * An item started or changed - the tool calls among them go to the chat whole, with what their command printed.
+     */
+    private void onItem(String threadId, @Nullable JsonObject item) {
+        Turn turn = myTurns.get(threadId);
+        if (turn == null || item == null) {
+            return;
+        }
+        String id = string(item, "id");
+        StringBuilder output = turn.myOutputs.get(id);
+        boolean finished = "completed".equals(string(item, "status")) || "failed".equals(string(item, "status"));
+        AIContent.ToolCall call = CodexItems.toolCall(item, output == null || finished ? null : output.toString());
+        if (call == null) {
+            return;
+        }
+        turn.myItems.put(id, item);
+        synchronized (turn) {
+            turn.myToolCalls.put(id, call);
+        }
+        if (turn.myListener != null) {
+            turn.myListener.onToolCall(call);
+        }
+    }
+
+    /**
+     * Cuts the history of the thread before the turn of the {@code keptPrompts + 1}-th prompt - the chat goes on from
+     * an earlier message. The files stay as they are.
+     */
+    CompletableFuture<?> revert(String threadId, int keptPrompts) {
+        JsonObject read = new JsonObject();
+        read.addProperty("threadId", threadId);
+        read.addProperty("includeTurns", true);
+        return myConnection.request("thread/read", read).thenCompose(result -> {
+            JsonObject thread = result.isJsonObject() ? object(result.getAsJsonObject(), "thread") : null;
+            JsonElement turns = thread == null ? null : thread.get("turns");
+            if (turns == null || !turns.isJsonArray() || turns.getAsJsonArray().size() <= keptPrompts) {
+                return CompletableFuture.completedFuture(null);
+            }
+            JsonElement turn = turns.getAsJsonArray().get(keptPrompts);
+            JsonObject params = new JsonObject();
+            params.addProperty("threadId", threadId);
+            params.addProperty("beforeTurnId", turn.isJsonObject() ? string(turn.getAsJsonObject(), "id") : "");
+            return myConnection.request("thread/revert", params);
+        });
+    }
+
     private CompletableFuture<JsonElement> approve(JsonObject params, String toolName, String command) {
         Turn turn = myTurns.get(string(params, "threadId"));
-        AIStreamListener listener = turn == null ? null : turn.myListener;
-        if (listener == null) {
+        if (turn == null || turn.myListener == null) {
             return CompletableFuture.completedFuture(decision("decline"));
         }
+        AIStreamListener listener = turn.myListener;
         String reason = string(params, "reason");
         JsonObject arguments = new JsonObject();
         if (!command.isEmpty()) {
@@ -475,19 +561,52 @@ final class CodexAppServer {
         if (!cwd.isEmpty()) {
             arguments.addProperty("cwd", cwd);
         }
+        // the changes the approval is about, from the item Codex told before it asked
+        JsonObject item = turn.myItems.get(string(params, "itemId"));
+        AIContent.ToolCall call = item == null ? null : CodexItems.toolCall(item, null);
+        List<AIToolCallContent> content = call == null ? List.of() : call.content();
+
+        JsonElement amendment = params.get("proposedExecpolicyAmendment");
+        List<AIToolPermissionOption> options = new ArrayList<>();
+        options.add(new AIToolPermissionOption("accept", CodexLocalize.approvalAccept().get(), AIToolPermissionOptionKind.ALLOW_ONCE));
+        options.add(new AIToolPermissionOption("acceptForSession", CodexLocalize.approvalAcceptForSession().get(), AIToolPermissionOptionKind.ALLOW_ALWAYS));
+        if (amendment != null && amendment.isJsonArray() && !amendment.getAsJsonArray().isEmpty()) {
+            List<String> prefix = new ArrayList<>();
+            amendment.getAsJsonArray().forEach(element -> prefix.add(element.getAsString()));
+            options.add(new AIToolPermissionOption("acceptWithExecpolicyAmendment",
+                CodexLocalize.approvalAcceptPrefix(String.join(" ", prefix)).get(), AIToolPermissionOptionKind.ALLOW_ALWAYS));
+        }
+        options.add(new AIToolPermissionOption("decline", CodexLocalize.approvalDecline().get(), AIToolPermissionOptionKind.REJECT_ONCE));
+        options.add(new AIToolPermissionOption("cancel", CodexLocalize.approvalCancel().get(), AIToolPermissionOptionKind.REJECT_ONCE));
+
         AIToolPermissionRequest request = new AIToolPermissionRequest(
             string(params, "itemId"),
             toolName,
-            command.isEmpty() ? toolName : command,
+            command.isEmpty() ? (call == null ? toolName : call.title()) : command,
             reason.isEmpty() ? null : reason,
-            arguments.toString()
+            arguments.toString(),
+            options,
+            content,
+            false
         );
         return listener.onToolPermission(request).handle((value, error) -> {
             if (value == null) {
                 return decision("cancel");
             }
-            AIToolPermissionDecision decision = value;
-            return decision(decision.allowed() ? (decision.always() ? "acceptForSession" : "accept") : "decline");
+            String optionId = value.optionId();
+            if (optionId == null) {
+                return decision(value.allowed() ? (value.always() ? "acceptForSession" : "accept") : "decline");
+            }
+            if ("acceptWithExecpolicyAmendment".equals(optionId) && amendment != null) {
+                JsonObject amended = new JsonObject();
+                amended.add("execpolicy_amendment", amendment);
+                JsonObject choice = new JsonObject();
+                choice.add("acceptWithExecpolicyAmendment", amended);
+                JsonObject result = new JsonObject();
+                result.add("decision", choice);
+                return result;
+            }
+            return decision(optionId);
         });
     }
 
@@ -556,6 +675,71 @@ final class CodexAppServer {
 
     // endregion
 
+    /**
+     * The message of the user as Codex takes it - a file is a mention, an image a data url, a selection the link of its
+     * file and its text.
+     */
+    private static JsonArray inputs(List<AIContent> content) {
+        JsonArray inputs = new JsonArray();
+        for (AIContent part : content) {
+            JsonObject input = new JsonObject();
+            switch (part) {
+                case AIContent.Text text -> {
+                    input.addProperty("type", "text");
+                    input.addProperty("text", text.text());
+                }
+                case AIContent.Image image -> {
+                    input.addProperty("type", "image");
+                    input.addProperty("url", "data:" + image.mediaType() + ";base64," + Base64.getEncoder().encodeToString(image.data()));
+                }
+                case AIContent.ResourceLink link when link.uri().startsWith("file:") -> {
+                    input.addProperty("type", "mention");
+                    input.addProperty("name", link.name());
+                    input.addProperty("path", Path.of(URI.create(link.uri())).toString());
+                }
+                case AIContent.ResourceLink link -> {
+                    input.addProperty("type", "text");
+                    input.addProperty("text", "[@" + link.name() + "](" + link.uri() + ")");
+                }
+                case AIContent.Resource resource -> {
+                    String uri = resource.uri();
+                    input.addProperty("type", "text");
+                    input.addProperty("text", "[@" + uri.substring(uri.lastIndexOf('/') + 1) + "](" + uri + ")\n<context ref=\"" + uri + "\">\n"
+                        + resource.text() + "\n</context>");
+                }
+                default -> {
+                    continue;
+                }
+            }
+            inputs.add(input);
+        }
+        return inputs;
+    }
+
+    /**
+     * The MCP servers of the IDE in the configuration of a thread - the model searches and navigates with the indexes
+     * of the IDE through them.
+     */
+    private static @Nullable JsonObject mcpConfig() {
+        JsonObject servers = new JsonObject();
+        Application.get().getExtensionPoint(AIMcpServerProvider.class).forEach(provider -> {
+            for (AIMcpServer server : provider.getServers()) {
+                JsonObject entry = new JsonObject();
+                entry.addProperty("url", server.url());
+                JsonObject headers = new JsonObject();
+                server.headers().forEach(headers::addProperty);
+                entry.add("http_headers", headers);
+                servers.add(server.name(), entry);
+            }
+        });
+        if (servers.isEmpty()) {
+            return null;
+        }
+        JsonObject config = new JsonObject();
+        config.add("mcp_servers", servers);
+        return config;
+    }
+
     private static JsonObject threadSettings(Path workingDirectory, @Nullable String model, CodexPermissionMode mode) {
         JsonObject params = new JsonObject();
         params.addProperty("cwd", workingDirectory.toAbsolutePath().toString());
@@ -564,6 +748,10 @@ final class CodexAppServer {
         }
         params.addProperty("approvalPolicy", mode.getApprovalPolicy());
         params.addProperty("sandbox", mode.getSandbox());
+        JsonObject config = mcpConfig();
+        if (config != null) {
+            params.add("config", config);
+        }
         return params;
     }
 
@@ -590,17 +778,51 @@ final class CodexAppServer {
                         }
                     }
                 }
+                List<AIContent> parts = new ArrayList<>();
                 if (!text.isEmpty()) {
-                    messages.add(AIMessage.user(text.toString()));
+                    parts.add(AIContent.text(text.toString()));
+                }
+                if (content != null && content.isJsonArray()) {
+                    for (JsonElement input : content.getAsJsonArray()) {
+                        if (input.isJsonObject() && "mention".equals(string(input.getAsJsonObject(), "type"))) {
+                            JsonObject mention = input.getAsJsonObject();
+                            parts.add(AIContent.resourceLink(Path.of(string(mention, "path")).toUri().toString(), string(mention, "name"), null));
+                        }
+                        else if (input.isJsonObject() && "image".equals(string(input.getAsJsonObject(), "type"))) {
+                            AIContent.Image image = dataUrl(string(input.getAsJsonObject(), "url"));
+                            if (image != null) {
+                                parts.add(image);
+                            }
+                        }
+                    }
+                }
+                if (!parts.isEmpty()) {
+                    messages.add(new AIMessage(AIRole.USER, parts));
                 }
             }
             case "agentMessage" -> append(messages, AIContent.text(string(item, "text")));
             default -> {
-                AIContent.ToolUse toolUse = toolUse(item);
-                if (toolUse != null) {
-                    append(messages, toolUse);
+                AIContent.ToolCall call = CodexItems.toolCall(item, null);
+                if (call != null) {
+                    append(messages, call);
                 }
             }
+        }
+    }
+
+    /**
+     * An image sent as a data url - the way the chat sends its images.
+     */
+    private static AIContent.@Nullable Image dataUrl(String url) {
+        int comma = url.indexOf(',');
+        if (!url.startsWith("data:") || comma < 0 || !url.substring(0, comma).endsWith(";base64")) {
+            return null;
+        }
+        try {
+            return AIContent.image(url.substring("data:".length(), url.indexOf(';')), Base64.getDecoder().decode(url.substring(comma + 1)));
+        }
+        catch (IllegalArgumentException e) {
+            return null;
         }
     }
 
@@ -614,34 +836,6 @@ final class CodexAppServer {
         else {
             messages.add(new AIMessage(AIRole.ASSISTANT, List.of(content)));
         }
-    }
-
-    /**
-     * What Codex ran - a command, a change of files, a tool of an MCP server - as a tool use of the chat.
-     */
-    private static AIContent.@Nullable ToolUse toolUse(JsonObject item) {
-        String id = string(item, "id");
-        return switch (string(item, "type")) {
-            case "commandExecution" -> {
-                JsonObject arguments = new JsonObject();
-                arguments.addProperty("command", string(item, "command"));
-                yield AIContent.toolUse(id, "shell", arguments.toString());
-            }
-            case "fileChange" -> {
-                JsonElement changes = item.get("changes");
-                yield AIContent.toolUse(id, "apply_patch", changes == null ? "{}" : changes.toString());
-            }
-            case "mcpToolCall" -> {
-                JsonElement arguments = item.get("arguments");
-                yield AIContent.toolUse(id, string(item, "server") + "/" + string(item, "tool"), arguments == null ? "{}" : arguments.toString());
-            }
-            case "webSearch" -> {
-                JsonObject arguments = new JsonObject();
-                arguments.addProperty("query", string(item, "query"));
-                yield AIContent.toolUse(id, "web_search", arguments.toString());
-            }
-            default -> null;
-        };
     }
 
     private static @Nullable JsonObject object(JsonObject object, String name) {

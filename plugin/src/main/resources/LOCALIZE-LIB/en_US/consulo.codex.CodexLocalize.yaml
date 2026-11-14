@@ -40,3 +40,13 @@ status.sign.in.failed:
     text: 'Sign-in did not finish: {0}'
 error.no.command.line:
     text: The codex command line was not found on the PATH
+approval.accept:
+    text: Yes, proceed
+approval.accept.for.session:
+    text: Yes, and don't ask again this session
+approval.accept.prefix:
+    text: 'Yes, and don''t ask again for commands starting with {0}'
+approval.decline:
+    text: No, continue without it
+approval.cancel:
+    text: No, and tell Codex what to do differently

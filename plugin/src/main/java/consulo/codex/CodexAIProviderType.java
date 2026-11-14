@@ -30,6 +30,7 @@ import consulo.codex.icon.CodexIconGroup;
 import consulo.codex.localize.CodexLocalize;
 import consulo.disposer.Disposable;
 import consulo.localize.LocalizeValue;
+import consulo.logging.Logger;
 import consulo.platform.Platform;
 import consulo.process.ProcessHandlerBuilderFactory;
 import consulo.process.cmd.GeneralCommandLine;
@@ -62,9 +63,15 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
     public static final String ID = "codex";
     static final String EXECUTABLE = "codex";
 
+    private static final Logger LOG = Logger.getInstance(CodexAIProviderType.class);
+
     private static final CodexModel DEFAULT_MODEL = new CodexModel(CodexModel.DEFAULT_ID, CodexLocalize.modelDefault());
 
     private final ProcessHandlerBuilderFactory myProcessHandlerBuilderFactory;
+    /**
+     * The threads being cut for a chat which started over - their next turn waits for it.
+     */
+    private final Map<String, CompletableFuture<?>> myReverts = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<CodexAppServer>> myServers = new ConcurrentHashMap<>();
     /**
      * The models of the account as the app server last listed them - known once a server ran.
@@ -218,8 +225,8 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
 
     @Override
     public CompletableFuture<AIResponse> chat(AIProvider provider, AIRequest request, @Nullable AIStreamListener listener) {
-        String text = lastUserText(request);
-        if (text == null) {
+        List<AIContent> content = lastUserContent(request);
+        if (content == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Nothing to send - the request has no user text"));
         }
         Path workingDirectory = request.getWorkingDirectory();
@@ -228,35 +235,57 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
         CodexPermissionMode mode = CodexPermissionMode.of(provider);
         String chatId = request.getSessionId();
 
-        return getServer(provider).thenCompose(server -> {
+        CompletableFuture<?> revert = chatId == null ? null : myReverts.get(chatId);
+        CompletableFuture<?> ready = revert == null ? CompletableFuture.completedFuture(null) : revert;
+        return ready.thenCompose(ignored -> getServer(provider)).thenCompose(server -> {
             if (chatId == null) {
-                return server.startThread(directory, model, mode).thenCompose(threadId -> server.startTurn(threadId, text, model, listener)
+                return server.startThread(directory, model, mode).thenCompose(threadId -> server.startTurn(threadId, content, model, listener)
                     .whenComplete((response, error) -> server.unloadThread(threadId)));
             }
-            return server.resumeThread(chatId, directory, model, mode).thenCompose(ignored -> server.startTurn(chatId, text, model, listener));
+            return server.resumeThread(chatId, directory, model, mode).thenCompose(ignored -> server.startTurn(chatId, content, model, listener));
         });
     }
 
-    private static Path directory(Project project) {
-        String basePath = project.getBasePath();
-        return basePath != null ? Path.of(basePath) : Platform.current().user().homePath();
+    /**
+     * Codex cuts the history of a thread itself - the chat goes on in the same thread from the message it was edited at.
+     */
+    @Override
+    public void startOver(AIProvider provider, String sessionId, List<AIMessage> history) {
+        int keptPrompts = (int) history.stream().filter(message -> message.role() == AIRole.USER && !message.getText().isBlank()).count();
+        CompletableFuture<?> revert = getServer(provider).thenCompose(server -> server.revert(sessionId, keptPrompts));
+        myReverts.put(sessionId, revert);
+        revert.whenComplete((ignored, error) -> {
+            myReverts.remove(sessionId, revert);
+            if (error != null) {
+                LOG.warn("Cannot cut the thread " + sessionId, error);
+            }
+        });
     }
 
-    private static @Nullable String lastUserText(AIRequest request) {
+    /**
+     * What the user said last - the text, and the images, files and selections it carries.
+     */
+    private static @Nullable List<AIContent> lastUserContent(AIRequest request) {
         List<AIMessage> messages = request.getMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             AIMessage message = messages.get(i);
             if (message.role() != AIRole.USER) {
                 continue;
             }
-            StringBuilder text = new StringBuilder();
-            for (AIContent content : message.content()) {
-                if (content instanceof AIContent.Text part) {
-                    text.append(part.text());
+            List<AIContent> content = new ArrayList<>();
+            for (AIContent part : message.content()) {
+                if (part instanceof AIContent.Text || part instanceof AIContent.Image
+                    || part instanceof AIContent.ResourceLink || part instanceof AIContent.Resource) {
+                    content.add(part);
                 }
             }
-            return text.isEmpty() ? null : text.toString();
+            return content.isEmpty() ? null : content;
         }
         return null;
+    }
+
+    private static Path directory(Project project) {
+        String basePath = project.getBasePath();
+        return basePath != null ? Path.of(basePath) : Platform.current().user().homePath();
     }
 }
