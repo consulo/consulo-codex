@@ -17,6 +17,7 @@ package consulo.codex;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import consulo.ai.AIChatHiddenContext;
@@ -321,7 +322,7 @@ final class CodexAppServer {
 
     CompletableFuture<String> startThread(Path workingDirectory, @Nullable String model, CodexPermissionMode mode) {
         JsonObject params = threadSettings(workingDirectory, model, mode);
-        return myConnection.request("thread/start", params).thenApply(result -> {
+        return setSkillRoots(workingDirectory).thenCompose(ignored -> myConnection.request("thread/start", params)).thenApply(result -> {
             JsonObject thread = result.isJsonObject() ? object(result.getAsJsonObject(), "thread") : null;
             String id = thread == null ? "" : string(thread, "id");
             if (id.isEmpty()) {
@@ -343,7 +344,26 @@ final class CodexAppServer {
         JsonObject params = threadSettings(workingDirectory, model, mode);
         params.addProperty("threadId", threadId);
         params.addProperty("excludeTurns", true);
-        return myConnection.request("thread/resume", params).thenRun(() -> myLoaded.add(threadId));
+        return setSkillRoots(workingDirectory)
+            .thenCompose(ignored -> myConnection.request("thread/resume", params))
+            .thenRun(() -> myLoaded.add(threadId));
+    }
+
+    /**
+     * The skills of the IDE for its tools, as an extra root of skills - Codex reads skills from it beside its own.
+     * A Codex without the request goes on without them.
+     */
+    private CompletableFuture<?> setSkillRoots(Path workingDirectory) {
+        JsonArray roots = new JsonArray();
+        for (Path plugin : AIMcpServerProvider.skillPlugins(workingDirectory, AIMcpServerProvider.AGENT_CODEX)) {
+            roots.add(plugin.resolve("skills").toString());
+        }
+        JsonObject params = new JsonObject();
+        params.add("extraRoots", roots);
+        return myConnection.request("skills/extraRoots/set", params).exceptionally(error -> {
+            LOG.warn("Codex did not take the skills of the IDE", error);
+            return JsonNull.INSTANCE;
+        });
     }
 
     void unloadThread(String threadId) {
