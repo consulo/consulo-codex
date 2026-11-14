@@ -18,6 +18,7 @@ package consulo.codex;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 import consulo.ai.AIChatHiddenContext;
 import consulo.ai.AIChatInfo;
 import consulo.ai.AIContent;
@@ -61,6 +62,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * One {@code codex app-server} process - JSON-RPC over its standard input and output - and the threads loaded in it.
@@ -214,6 +217,8 @@ final class CodexAppServer {
         connection.onRequest("item/commandExecution/requestApproval", params -> approve(params, "shell", string(params, "command")));
         connection.onRequest("item/fileChange/requestApproval", params -> approve(params, "apply_patch", ""));
         connection.onRequest("item/tool/requestUserInput", this::askUser);
+        connection.onRequest("item/permissions/requestApproval", this::approvePermissions);
+        connection.onRequest("mcpServer/elicitation/request", this::elicit);
     }
 
     static CompletableFuture<CodexAppServer> start(ProcessHandlerBuilderFactory factory, GeneralCommandLine commandLine) {
@@ -646,6 +651,9 @@ final class CodexAppServer {
         });
     }
 
+    private static final String NETWORK_OPTION_PREFIX = "network:";
+    private static final Pattern MCP_TOOL = Pattern.compile("tool \"([^\"]+)\"");
+
     private CompletableFuture<JsonElement> approve(JsonObject params, String toolName, String command) {
         Turn turn = myTurns.get(string(params, "threadId"));
         if (turn == null || turn.myListener == null) {
@@ -676,8 +684,32 @@ final class CodexAppServer {
             options.add(new AIToolPermissionOption("acceptWithExecpolicyAmendment",
                 CodexLocalize.approvalAcceptPrefix(String.join(" ", prefix)).get(), AIToolPermissionOptionKind.ALLOW_ALWAYS));
         }
+        // a command which reaches a host asks for a rule for the host too
+        List<JsonObject> networkAmendments = new ArrayList<>();
+        JsonElement network = params.get("proposedNetworkPolicyAmendments");
+        if (network != null && network.isJsonArray()) {
+            for (JsonElement element : network.getAsJsonArray()) {
+                if (!element.isJsonObject()) {
+                    continue;
+                }
+                JsonObject networkAmendment = element.getAsJsonObject();
+                String host = string(networkAmendment, "host");
+                boolean allow = "allow".equals(string(networkAmendment, "action"));
+                options.add(new AIToolPermissionOption(
+                    NETWORK_OPTION_PREFIX + networkAmendments.size(),
+                    allow ? CodexLocalize.approvalNetworkAllow(host).get() : CodexLocalize.approvalNetworkDeny(host).get(),
+                    allow ? AIToolPermissionOptionKind.ALLOW_ALWAYS : AIToolPermissionOptionKind.REJECT_ALWAYS
+                ));
+                networkAmendments.add(networkAmendment);
+            }
+        }
         options.add(new AIToolPermissionOption("decline", CodexLocalize.approvalDecline().get(), AIToolPermissionOptionKind.REJECT_ONCE));
         options.add(new AIToolPermissionOption("cancel", CodexLocalize.approvalCancel().get(), AIToolPermissionOptionKind.REJECT_ONCE));
+
+        JsonObject networkContext = params.get("networkApprovalContext") instanceof JsonObject context ? context : null;
+        if (networkContext != null && reason.isEmpty()) {
+            reason = CodexLocalize.approvalNetworkReason(string(networkContext, "host")).get();
+        }
 
         AIToolPermissionRequest request = new AIToolPermissionRequest(
             string(params, "itemId"),
@@ -696,6 +728,16 @@ final class CodexAppServer {
             String optionId = value.optionId();
             if (optionId == null) {
                 return decision(value.allowed() ? (value.always() ? "acceptForSession" : "accept") : "decline");
+            }
+            if (optionId.startsWith(NETWORK_OPTION_PREFIX)) {
+                int index = Integer.parseInt(optionId.substring(NETWORK_OPTION_PREFIX.length()));
+                JsonObject amended = new JsonObject();
+                amended.add("network_policy_amendment", networkAmendments.get(index));
+                JsonObject choice = new JsonObject();
+                choice.add("applyNetworkPolicyAmendment", amended);
+                JsonObject result = new JsonObject();
+                result.add("decision", choice);
+                return result;
             }
             if ("acceptWithExecpolicyAmendment".equals(optionId) && amendment != null) {
                 JsonObject amended = new JsonObject();
@@ -751,6 +793,283 @@ final class CodexAppServer {
             }
             return answers(byId);
         });
+    }
+
+    /**
+     * Codex asks for more than its sandbox allows - the network, paths to read or write. Allowing grants what it asked
+     * for, for the turn or the rest of the chat.
+     */
+    private CompletableFuture<JsonElement> approvePermissions(JsonObject params) {
+        Turn turn = myTurns.get(string(params, "threadId"));
+        JsonObject requested = params.get("permissions") instanceof JsonObject permissions ? permissions : new JsonObject();
+        if (turn == null || turn.myListener == null) {
+            return CompletableFuture.completedFuture(grant(new JsonObject(), "turn"));
+        }
+        String reason = string(params, "reason");
+        List<AIToolPermissionOption> options = List.of(
+            new AIToolPermissionOption("turn", CodexLocalize.permissionsAllowTurn().get(), AIToolPermissionOptionKind.ALLOW_ONCE),
+            new AIToolPermissionOption("session", CodexLocalize.permissionsAllowSession().get(), AIToolPermissionOptionKind.ALLOW_ALWAYS),
+            new AIToolPermissionOption("decline", CodexLocalize.approvalDecline().get(), AIToolPermissionOptionKind.REJECT_ONCE)
+        );
+        AIToolPermissionRequest request = new AIToolPermissionRequest(
+            string(params, "itemId"),
+            "permissions",
+            CodexLocalize.permissionsTitle(describe(requested)).get(),
+            reason.isEmpty() ? null : reason,
+            requested.toString(),
+            options,
+            List.of(),
+            false
+        );
+        return turn.myListener.onToolPermission(request).handle((value, error) -> {
+            String optionId = value == null ? "decline" : value.optionId();
+            if (optionId == null) {
+                optionId = value.allowed() ? (value.always() ? "session" : "turn") : "decline";
+            }
+            return "decline".equals(optionId) ? grant(new JsonObject(), "turn") : grant(requested, optionId);
+        });
+    }
+
+    private static JsonObject grant(JsonObject permissions, String scope) {
+        JsonObject result = new JsonObject();
+        result.add("permissions", permissions);
+        result.addProperty("scope", scope);
+        return result;
+    }
+
+    /**
+     * What a permission profile asks for, in a few words - the network, the paths and how.
+     */
+    private static String describe(JsonObject permissions) {
+        List<String> parts = new ArrayList<>();
+        if (permissions.get("network") instanceof JsonObject network && bool(network, "enabled")) {
+            parts.add(CodexLocalize.permissionsNetwork().get());
+        }
+        if (permissions.get("fileSystem") instanceof JsonObject fileSystem) {
+            for (String access : List.of("read", "write")) {
+                if (fileSystem.get(access) instanceof JsonArray paths) {
+                    for (JsonElement path : paths) {
+                        parts.add(access + " " + path.getAsString());
+                    }
+                }
+            }
+            if (fileSystem.get("entries") instanceof JsonArray entries) {
+                for (JsonElement entry : entries) {
+                    if (entry instanceof JsonObject object && object.get("path") instanceof JsonObject path) {
+                        String where = string(path, "path");
+                        parts.add(string(object, "access") + " " + (where.isEmpty() ? nonEmpty(string(path, "pattern"), string(path, "value")) : where));
+                    }
+                }
+            }
+        }
+        return parts.isEmpty() ? CodexLocalize.permissionsMore().get() : String.join(", ", parts);
+    }
+
+    private static String nonEmpty(String value, String fallback) {
+        return value.isEmpty() ? fallback : value;
+    }
+
+    /**
+     * An MCP server of Codex asks the user for something - a form, a field a question, or a page to open.
+     */
+    private CompletableFuture<JsonElement> elicit(JsonObject params) {
+        Turn turn = myTurns.get(string(params, "threadId"));
+        AIStreamListener listener = turn == null ? null : turn.myListener;
+        if (listener == null) {
+            return CompletableFuture.completedFuture(elicitation("cancel", null));
+        }
+        String server = string(params, "serverName");
+        String message = string(params, "message");
+        JsonObject meta = params.get("_meta") instanceof JsonObject object ? object : new JsonObject();
+        if ("mcp_tool_call".equals(string(meta, "codex_approval_kind"))) {
+            return approveMcpTool(listener, server, message, meta);
+        }
+        if ("url".equals(string(params, "mode"))) {
+            String url = string(params, "url");
+            String open = CodexLocalize.elicitationOpened().get();
+            AIQuestion question = new AIQuestion(message + "\n" + url, server, List.of(
+                new AIQuestionOption(open, url),
+                new AIQuestionOption(CodexLocalize.elicitationDecline().get(), "")
+            ), false);
+            return listener.onQuestion(List.of(question)).handle((replies, error) -> {
+                String reply = replies == null ? null : replies.get(question.question());
+                return elicitation(reply == null ? "cancel" : open.equals(reply) ? "accept" : "decline", null);
+            });
+        }
+
+        JsonObject schema = params.get("requestedSchema") instanceof JsonObject requested ? requested : new JsonObject();
+        JsonObject properties = schema.get("properties") instanceof JsonObject fields ? fields : new JsonObject();
+        Map<String, String> names = new LinkedHashMap<>();
+        Map<String, JsonObject> fields = new LinkedHashMap<>();
+        List<AIQuestion> questions = new ArrayList<>();
+        for (Map.Entry<String, JsonElement> entry : properties.entrySet()) {
+            if (!(entry.getValue() instanceof JsonObject field)) {
+                continue;
+            }
+            String title = nonEmpty(string(field, "title"), entry.getKey());
+            String description = string(field, "description");
+            String text = questions.isEmpty() && !message.isEmpty() ? message + "\n" + nonEmpty(description, title) : nonEmpty(description, title);
+            List<AIQuestionOption> options = new ArrayList<>();
+            for (String[] choice : choices(field)) {
+                options.add(new AIQuestionOption(choice[1], ""));
+            }
+            questions.add(new AIQuestion(text, title, options, "array".equals(string(field, "type"))));
+            names.put(text, entry.getKey());
+            fields.put(entry.getKey(), field);
+        }
+        if (questions.isEmpty()) {
+            questions.add(new AIQuestion(message, server, List.of(
+                new AIQuestionOption(CodexLocalize.elicitationAccept().get(), ""),
+                new AIQuestionOption(CodexLocalize.elicitationDecline().get(), "")
+            ), false));
+        }
+        return listener.onQuestion(questions).handle((replies, error) -> {
+            if (replies == null || replies.isEmpty()) {
+                return elicitation("cancel", null);
+            }
+            if (fields.isEmpty()) {
+                return elicitation(CodexLocalize.elicitationAccept().get().equals(replies.get(message)) ? "accept" : "decline", null);
+            }
+            JsonObject content = new JsonObject();
+            replies.forEach((question, reply) -> {
+                String name = names.get(question);
+                JsonObject field = name == null ? null : fields.get(name);
+                if (field != null) {
+                    content.add(name, value(field, reply));
+                }
+            });
+            return elicitation("accept", content);
+        });
+    }
+
+    /**
+     * Codex asks before a tool of an MCP server changes something - an approval like the one of a command, which may
+     * be remembered for the chat or for good when Codex offers that.
+     */
+    private CompletableFuture<JsonElement> approveMcpTool(AIStreamListener listener, String server, String message, JsonObject meta) {
+        List<String> persist = new ArrayList<>();
+        if (meta.get("persist") instanceof JsonArray values) {
+            values.forEach(value -> persist.add(value.getAsString()));
+        }
+        List<AIToolPermissionOption> options = new ArrayList<>();
+        options.add(new AIToolPermissionOption("accept", CodexLocalize.approvalAccept().get(), AIToolPermissionOptionKind.ALLOW_ONCE));
+        if (persist.contains("session")) {
+            options.add(new AIToolPermissionOption("session", CodexLocalize.approvalMcpSession().get(), AIToolPermissionOptionKind.ALLOW_ALWAYS));
+        }
+        if (persist.contains("always")) {
+            options.add(new AIToolPermissionOption("always", CodexLocalize.approvalMcpAlways().get(), AIToolPermissionOptionKind.ALLOW_ALWAYS));
+        }
+        options.add(new AIToolPermissionOption("decline", CodexLocalize.approvalDecline().get(), AIToolPermissionOptionKind.REJECT_ONCE));
+
+        String description = string(meta, "tool_description");
+        // the card asks "Allow ...?" itself - it names the tool, the message of Codex is the whole question
+        Matcher tool = MCP_TOOL.matcher(message);
+        AIToolPermissionRequest request = new AIToolPermissionRequest(
+            "mcp:" + server,
+            "mcp",
+            tool.find() ? server + "/" + tool.group(1) : message,
+            description.isEmpty() ? null : description,
+            meta.get("tool_params") instanceof JsonObject toolParams ? toolParams.toString() : "{}",
+            options,
+            List.of(),
+            false
+        );
+        return listener.onToolPermission(request).handle((value, error) -> {
+            if (value == null) {
+                return elicitation("cancel", null);
+            }
+            String optionId = value.optionId();
+            if (optionId == null) {
+                optionId = value.allowed() ? (value.always() && persist.contains("session") ? "session" : "accept") : "decline";
+            }
+            if ("decline".equals(optionId)) {
+                return elicitation("decline", null);
+            }
+            JsonObject result = elicitation("accept", null);
+            if (!"accept".equals(optionId)) {
+                JsonObject resultMeta = new JsonObject();
+                resultMeta.addProperty("persist", optionId);
+                result.add("_meta", resultMeta);
+            }
+            return result;
+        });
+    }
+
+    /**
+     * The choices of a field as {value, title} - an enum, titled or not, a boolean as yes and no.
+     */
+    private static List<String[]> choices(JsonObject field) {
+        List<String[]> choices = new ArrayList<>();
+        if ("boolean".equals(string(field, "type"))) {
+            choices.add(new String[]{"true", CodexLocalize.elicitationYes().get()});
+            choices.add(new String[]{"false", CodexLocalize.elicitationNo().get()});
+            return choices;
+        }
+        JsonObject items = field.get("items") instanceof JsonObject arrayItems ? arrayItems : field;
+        JsonElement titled = items.has("oneOf") ? items.get("oneOf") : items.get("anyOf");
+        if (titled instanceof JsonArray options) {
+            for (JsonElement option : options) {
+                if (option instanceof JsonObject object) {
+                    choices.add(new String[]{string(object, "const"), nonEmpty(string(object, "title"), string(object, "const"))});
+                }
+            }
+            return choices;
+        }
+        if (items.get("enum") instanceof JsonArray values) {
+            JsonArray titles = items.get("enumNames") instanceof JsonArray enumNames ? enumNames : null;
+            for (int i = 0; i < values.size(); i++) {
+                String value = values.get(i).getAsString();
+                choices.add(new String[]{value, titles != null && i < titles.size() ? titles.get(i).getAsString() : value});
+            }
+        }
+        return choices;
+    }
+
+    /**
+     * The answer as the type of the field wants it - a chosen title back to its value, a number, a boolean.
+     */
+    private static JsonElement value(JsonObject field, String reply) {
+        String type = string(field, "type");
+        List<String[]> choices = choices(field);
+        if ("array".equals(type)) {
+            JsonArray values = new JsonArray();
+            for (String part : reply.split(",\\s*")) {
+                values.add(choiceValue(choices, part));
+            }
+            return values;
+        }
+        String chosen = choiceValue(choices, reply);
+        return switch (type) {
+            case "boolean" -> new JsonPrimitive(Boolean.parseBoolean(chosen));
+            case "number", "integer" -> {
+                try {
+                    double number = Double.parseDouble(chosen.strip());
+                    yield "integer".equals(type) ? new JsonPrimitive((long) number) : new JsonPrimitive(number);
+                }
+                catch (NumberFormatException e) {
+                    yield new JsonPrimitive(chosen);
+                }
+            }
+            default -> new JsonPrimitive(chosen);
+        };
+    }
+
+    private static String choiceValue(List<String[]> choices, String reply) {
+        for (String[] choice : choices) {
+            if (choice[1].equals(reply)) {
+                return choice[0];
+            }
+        }
+        return reply;
+    }
+
+    private static JsonObject elicitation(String action, @Nullable JsonObject content) {
+        JsonObject result = new JsonObject();
+        result.addProperty("action", action);
+        if (content != null) {
+            result.add("content", content);
+        }
+        return result;
     }
 
     private static JsonObject decision(String decision) {

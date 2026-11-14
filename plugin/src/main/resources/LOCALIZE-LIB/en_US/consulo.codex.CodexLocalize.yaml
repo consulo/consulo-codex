@@ -50,6 +50,36 @@ approval.decline:
     text: No, continue without it
 approval.cancel:
     text: No, and tell Codex what to do differently
+approval.mcp.session:
+    text: Yes, and don't ask again for this tool in this chat
+approval.mcp.always:
+    text: Yes, and always allow this tool
+approval.network.allow:
+    text: 'Yes, and always allow {0}'
+approval.network.deny:
+    text: 'No, and always block {0}'
+approval.network.reason:
+    text: 'The command connects to {0}'
+permissions.title:
+    text: 'Codex asks for more access: {0}'
+permissions.network:
+    text: network access
+permissions.more:
+    text: more access than its sandbox gives
+permissions.allow.turn:
+    text: Allow for this turn
+permissions.allow.session:
+    text: Allow for this chat
+elicitation.yes:
+    text: 'Yes'
+elicitation.no:
+    text: 'No'
+elicitation.accept:
+    text: Accept
+elicitation.decline:
+    text: Decline
+elicitation.opened:
+    text: I opened the page and finished there
 option.mode:
     text: Mode
 option.mode.default:
