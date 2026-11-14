@@ -50,3 +50,13 @@ approval.decline:
     text: No, continue without it
 approval.cancel:
     text: No, and tell Codex what to do differently
+option.mode:
+    text: Mode
+option.mode.default:
+    text: Default
+option.mode.default.description:
+    text: Codex works on the task
+option.mode.plan:
+    text: Plan
+option.mode.plan.description:
+    text: Codex plans the task and changes nothing

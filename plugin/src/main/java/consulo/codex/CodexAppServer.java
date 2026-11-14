@@ -18,6 +18,7 @@ package consulo.codex;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import consulo.ai.AIChatHiddenContext;
 import consulo.ai.AIChatInfo;
 import consulo.ai.AIContent;
 import consulo.ai.AIContextUsage;
@@ -39,6 +40,7 @@ import consulo.ai.AIUsage;
 import consulo.ai.acp.AcpConnection;
 import consulo.application.Application;
 import consulo.codex.localize.CodexLocalize;
+import consulo.logging.Logger;
 import consulo.process.ExecutionException;
 import consulo.process.ProcessHandlerBuilderFactory;
 import consulo.process.cmd.GeneralCommandLine;
@@ -46,12 +48,15 @@ import org.jspecify.annotations.Nullable;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -66,6 +71,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * @since 2026-11-10
  */
 final class CodexAppServer {
+    private static final Logger LOG = Logger.getInstance(CodexAppServer.class);
+    private static final String PLAN_DIRECTORY = ".consulo/ai-plans";
+
     /**
      * How many threads of a directory the chat tree shows.
      */
@@ -95,9 +103,15 @@ final class CodexAppServer {
         final Map<String, JsonObject> myItems = new ConcurrentHashMap<>();
         final Map<String, StringBuilder> myOutputs = new ConcurrentHashMap<>();
         volatile @Nullable String myTurnId;
+        /**
+         * Where the plan of a turn in plan mode is saved - null for a turn of the default mode.
+         */
+        final @Nullable Path myPlanDirectory;
+        volatile boolean myPlanSaved;
 
-        Turn(@Nullable AIStreamListener listener) {
+        Turn(@Nullable AIStreamListener listener, @Nullable Path planDirectory) {
             myListener = listener;
+            myPlanDirectory = planDirectory;
         }
     }
 
@@ -218,6 +232,10 @@ final class CodexAppServer {
         clientInfo.addProperty("version", "3");
         JsonObject params = new JsonObject();
         params.add("clientInfo", clientInfo);
+        // the plan mode of a turn - its collaboration mode - is an experimental part of the protocol
+        JsonObject capabilities = new JsonObject();
+        capabilities.addProperty("experimentalApi", true);
+        params.add("capabilities", capabilities);
         return connection.request("initialize", params).thenApply(result -> {
             connection.notify("initialized", new JsonObject());
             return server;
@@ -429,8 +447,33 @@ final class CodexAppServer {
      * Sends the text as a turn of the thread and completes once Codex finished the turn. Cancelling the future
      * interrupts the turn.
      */
-    CompletableFuture<AIResponse> startTurn(String threadId, List<AIContent> content, @Nullable String model, @Nullable AIStreamListener listener) {
-        Turn turn = new Turn(listener);
+    CompletableFuture<AIResponse> startTurn(String threadId,
+                                            List<AIContent> content,
+                                            @Nullable String model,
+                                            @Nullable Path planDirectory,
+                                            @Nullable AIStreamListener listener) {
+        CompletableFuture<@Nullable String> collaborationModel = model != null
+            ? CompletableFuture.completedFuture(model)
+            : listModels().<@Nullable String>thenApply(CodexAppServer::defaultModel).exceptionally(error -> null);
+        return collaborationModel.thenCompose(resolved -> startTurn(threadId, content, model, resolved, planDirectory, listener));
+    }
+
+    private static @Nullable String defaultModel(List<Model> models) {
+        for (Model model : models) {
+            if (model.isDefault()) {
+                return model.id();
+            }
+        }
+        return models.isEmpty() ? null : models.getFirst().id();
+    }
+
+    private CompletableFuture<AIResponse> startTurn(String threadId,
+                                                    List<AIContent> content,
+                                                    @Nullable String model,
+                                                    @Nullable String collaborationModel,
+                                                    @Nullable Path planDirectory,
+                                                    @Nullable AIStreamListener listener) {
+        Turn turn = new Turn(listener, planDirectory);
         if (myTurns.putIfAbsent(threadId, turn) != null) {
             return CompletableFuture.failedFuture(new IllegalStateException("The chat is still answering"));
         }
@@ -442,6 +485,15 @@ final class CodexAppServer {
         params.add("input", inputs);
         if (model != null) {
             params.addProperty("model", model);
+        }
+        // the mode stays with the thread - every turn tells it, so leaving plan mode works too
+        if (collaborationModel != null) {
+            JsonObject settings = new JsonObject();
+            settings.addProperty("model", collaborationModel);
+            JsonObject collaboration = new JsonObject();
+            collaboration.addProperty("mode", planDirectory != null ? "plan" : "default");
+            collaboration.add("settings", settings);
+            params.add("collaborationMode", collaboration);
         }
 
         myConnection.request("turn/start", params).whenComplete((result, error) -> {
@@ -508,6 +560,10 @@ final class CodexAppServer {
         if (turn == null || item == null) {
             return;
         }
+        if ("plan".equals(string(item, "type"))) {
+            onPlan(turn, string(item, "text"));
+            return;
+        }
         String id = string(item, "id");
         StringBuilder output = turn.myOutputs.get(id);
         boolean finished = "completed".equals(string(item, "status")) || "failed".equals(string(item, "status"));
@@ -522,6 +578,50 @@ final class CodexAppServer {
         if (turn.myListener != null) {
             turn.myListener.onToolCall(call);
         }
+    }
+
+    /**
+     * The plan of a turn in plan mode - shown in the answer, and saved as a file the chat opens for review.
+     */
+    private static void onPlan(Turn turn, String text) {
+        Path directory = turn.myPlanDirectory;
+        if (text.isBlank() || turn.myPlanSaved) {
+            return;
+        }
+        turn.myPlanSaved = true;
+        String shown = "\n\n" + text.strip() + "\n";
+        synchronized (turn) {
+            turn.myText.append(shown);
+        }
+        AIStreamListener listener = turn.myListener;
+        if (listener == null) {
+            return;
+        }
+        listener.onTextDelta(shown);
+        if (directory == null) {
+            return;
+        }
+        try {
+            Path file = directory.resolve(PLAN_DIRECTORY).resolve(planName(text) + "-" + Integer.toHexString(text.hashCode()) + ".plan.md");
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, text, StandardCharsets.UTF_8);
+            listener.onPlanFile(file);
+        }
+        catch (IOException e) {
+            LOG.warn("Cannot save the plan", e);
+        }
+    }
+
+    /**
+     * The first heading of the plan as a file name.
+     */
+    private static String planName(String text) {
+        String title = text.lines().filter(line -> line.startsWith("#")).findFirst().orElse("plan").replaceFirst("^#+", "").strip();
+        String name = title.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "-").replaceAll("^-|-$", "");
+        if (name.length() > 48) {
+            name = name.substring(0, 48);
+        }
+        return name.isEmpty() ? "plan" : name;
     }
 
     /**
@@ -758,7 +858,8 @@ final class CodexAppServer {
     private static AIChatInfo info(JsonObject thread) {
         String name = string(thread, "name");
         if (name.isBlank()) {
-            name = string(thread, "preview").strip().lines().findFirst().orElse("");
+            // the preview is the first prompt as it was sent - the hidden rules in front of it are not its title
+            name = AIChatHiddenContext.strip(string(thread, "preview")).strip().lines().findFirst().orElse("");
         }
         String cwd = string(thread, "cwd");
         JsonElement updated = thread.get("updatedAt");

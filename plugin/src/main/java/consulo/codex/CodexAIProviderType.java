@@ -16,6 +16,7 @@
 package consulo.codex;
 
 import consulo.ai.AIChatInfo;
+import consulo.ai.AIChatSessionListener;
 import consulo.ai.AIContent;
 import consulo.ai.AIMessage;
 import consulo.ai.AIModel;
@@ -24,11 +25,14 @@ import consulo.ai.AIProviderTypeWithChats;
 import consulo.ai.AIRequest;
 import consulo.ai.AIResponse;
 import consulo.ai.AIRole;
+import consulo.ai.AISessionOption;
+import consulo.ai.AISessionOptionValue;
 import consulo.ai.AIStreamListener;
 import consulo.annotation.component.ExtensionImpl;
 import consulo.codex.icon.CodexIconGroup;
 import consulo.codex.localize.CodexLocalize;
 import consulo.disposer.Disposable;
+import consulo.disposer.Disposer;
 import consulo.localize.LocalizeValue;
 import consulo.logging.Logger;
 import consulo.platform.Platform;
@@ -47,8 +51,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Codex through its native app server: it signs in on its own, keeps the threads - the chats - on its side and runs its
@@ -60,6 +66,10 @@ import java.util.concurrent.ConcurrentHashMap;
 @ExtensionImpl
 @Singleton
 public class CodexAIProviderType implements AIProviderTypeWithChats {
+    private static final String MODE_OPTION = "mode";
+    private static final String DEFAULT_MODE = "default";
+    private static final String PLAN_MODE = "plan";
+
     public static final String ID = "codex";
     static final String EXECUTABLE = "codex";
 
@@ -72,6 +82,11 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
      * The threads being cut for a chat which started over - their next turn waits for it.
      */
     private final Map<String, CompletableFuture<?>> myReverts = new ConcurrentHashMap<>();
+    /**
+     * The chats in plan mode - the collaboration mode of their next turn.
+     */
+    private final Set<String> myPlanChats = ConcurrentHashMap.newKeySet();
+    private final Map<String, List<AIChatSessionListener>> mySessionListeners = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<CodexAppServer>> myServers = new ConcurrentHashMap<>();
     /**
      * The models of the account as the app server last listed them - known once a server ran.
@@ -223,6 +238,45 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
 
     // endregion
 
+    /**
+     * The collaboration mode of Codex as the mode of the chat - the default one, or planning.
+     */
+    @Override
+    public List<AISessionOption> getSessionOptions(AIProvider provider, String sessionId) {
+        return List.of(new AISessionOption(MODE_OPTION, CodexLocalize.optionMode().get(), null, AISessionOption.CATEGORY_MODE, "select",
+            myPlanChats.contains(sessionId) ? PLAN_MODE : DEFAULT_MODE,
+            List.of(
+                new AISessionOptionValue(DEFAULT_MODE, CodexLocalize.optionModeDefault().get(), CodexLocalize.optionModeDefaultDescription().get()),
+                new AISessionOptionValue(PLAN_MODE, CodexLocalize.optionModePlan().get(), CodexLocalize.optionModePlanDescription().get())
+            )));
+    }
+
+    @Override
+    public CompletableFuture<List<AISessionOption>> setSessionOption(AIProvider provider, String sessionId, String optionId, String value) {
+        if (!MODE_OPTION.equals(optionId)) {
+            return AIProviderTypeWithChats.super.setSessionOption(provider, sessionId, optionId, value);
+        }
+        if (PLAN_MODE.equals(value)) {
+            myPlanChats.add(sessionId);
+        }
+        else {
+            myPlanChats.remove(sessionId);
+        }
+        List<AISessionOption> options = getSessionOptions(provider, sessionId);
+        for (AIChatSessionListener listener : mySessionListeners.getOrDefault(sessionId, List.of())) {
+            listener.optionsChanged(options);
+        }
+        return CompletableFuture.completedFuture(options);
+    }
+
+    @Override
+    public void addSessionListener(AIProvider provider, String sessionId, AIChatSessionListener listener, Disposable parentDisposable) {
+        List<AIChatSessionListener> listeners = mySessionListeners.computeIfAbsent(sessionId, id -> new CopyOnWriteArrayList<>());
+        listeners.add(listener);
+        Disposer.register(parentDisposable, () -> listeners.remove(listener));
+        listener.optionsChanged(getSessionOptions(provider, sessionId));
+    }
+
     @Override
     public CompletableFuture<AIResponse> chat(AIProvider provider, AIRequest request, @Nullable AIStreamListener listener) {
         List<AIContent> content = lastUserContent(request);
@@ -234,15 +288,16 @@ public class CodexAIProviderType implements AIProviderTypeWithChats {
         String model = CodexModel.DEFAULT_ID.equals(request.getModel().getId()) ? null : request.getModel().getId();
         CodexPermissionMode mode = CodexPermissionMode.of(provider);
         String chatId = request.getSessionId();
+        Path planDirectory = chatId != null && myPlanChats.contains(chatId) ? directory : null;
 
         CompletableFuture<?> revert = chatId == null ? null : myReverts.get(chatId);
         CompletableFuture<?> ready = revert == null ? CompletableFuture.completedFuture(null) : revert;
         return ready.thenCompose(ignored -> getServer(provider)).thenCompose(server -> {
             if (chatId == null) {
-                return server.startThread(directory, model, mode).thenCompose(threadId -> server.startTurn(threadId, content, model, listener)
+                return server.startThread(directory, model, mode).thenCompose(threadId -> server.startTurn(threadId, content, model, null, listener)
                     .whenComplete((response, error) -> server.unloadThread(threadId)));
             }
-            return server.resumeThread(chatId, directory, model, mode).thenCompose(ignored -> server.startTurn(chatId, content, model, listener));
+            return server.resumeThread(chatId, directory, model, mode).thenCompose(ignored -> server.startTurn(chatId, content, model, planDirectory, listener));
         });
     }
 
