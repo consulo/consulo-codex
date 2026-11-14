@@ -672,6 +672,7 @@ final class CodexAppServer {
     }
 
     private static final String NETWORK_OPTION_PREFIX = "network:";
+    private static final Pattern FILE_LINK = Pattern.compile("\\[@([^\\]]+)]\\((/[^)]+)\\)");
     private static final Pattern MCP_TOOL = Pattern.compile("tool \"([^\"]+)\"");
 
     private CompletableFuture<JsonElement> approve(JsonObject params, String toolName, String command) {
@@ -1132,9 +1133,9 @@ final class CodexAppServer {
                     input.addProperty("url", "data:" + image.mediaType() + ";base64," + Base64.getEncoder().encodeToString(image.data()));
                 }
                 case AIContent.ResourceLink link when link.uri().startsWith("file:") -> {
-                    input.addProperty("type", "mention");
-                    input.addProperty("name", link.name());
-                    input.addProperty("path", Path.of(URI.create(link.uri())).toString());
+                    // a mention of Codex names an app or a plugin - a file goes as its path, which Codex reads itself
+                    input.addProperty("type", "text");
+                    input.addProperty("text", "[@" + link.name() + "](" + Path.of(URI.create(link.uri())) + ")");
                 }
                 case AIContent.ResourceLink link -> {
                     input.addProperty("type", "text");
@@ -1214,7 +1215,11 @@ final class CodexAppServer {
                 if (content != null && content.isJsonArray()) {
                     for (JsonElement input : content.getAsJsonArray()) {
                         if (input.isJsonObject() && "text".equals(string(input.getAsJsonObject(), "type"))) {
-                            text.append(string(input.getAsJsonObject(), "text"));
+                            String value = string(input.getAsJsonObject(), "text");
+                            // a file the chat attached is a text of its own - it comes back as the attachment
+                            if (!FILE_LINK.matcher(value).matches()) {
+                                text.append(value);
+                            }
                         }
                     }
                 }
@@ -1224,7 +1229,13 @@ final class CodexAppServer {
                 }
                 if (content != null && content.isJsonArray()) {
                     for (JsonElement input : content.getAsJsonArray()) {
-                        if (input.isJsonObject() && "mention".equals(string(input.getAsJsonObject(), "type"))) {
+                        Matcher fileLink = input.isJsonObject() && "text".equals(string(input.getAsJsonObject(), "type"))
+                            ? FILE_LINK.matcher(string(input.getAsJsonObject(), "text"))
+                            : null;
+                        if (fileLink != null && fileLink.matches()) {
+                            parts.add(AIContent.resourceLink(Path.of(fileLink.group(2)).toUri().toString(), fileLink.group(1), null));
+                        }
+                        else if (input.isJsonObject() && "mention".equals(string(input.getAsJsonObject(), "type"))) {
                             JsonObject mention = input.getAsJsonObject();
                             parts.add(AIContent.resourceLink(Path.of(string(mention, "path")).toUri().toString(), string(mention, "name"), null));
                         }
